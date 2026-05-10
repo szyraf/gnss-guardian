@@ -4,7 +4,6 @@ import math
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
@@ -51,7 +50,7 @@ DATASETS = {
 
 NORMAL = "#2E8B57"
 ATTACK = "#E11D48"
-TRACE = "rgba(120, 120, 120, 0.45)"
+TRACE = "rgba(80, 80, 80, 0.75)"
 
 # Plotly chart config — scroll zoom is OFF by default in plotly, we need to flip it.
 MAP_CONFIG = {
@@ -59,7 +58,6 @@ MAP_CONFIG = {
     "displaylogo": False,
     "modeBarButtonsToRemove": ["lasso2d", "select2d"],
 }
-CHART_CONFIG = {"displaylogo": False}
 
 
 st.set_page_config(
@@ -388,43 +386,6 @@ def metrics(items):
             st.metric(label, value, delta=hint, delta_color="off")
 
 
-def overview_tab():
-    left, right = st.columns([3, 2])
-    with left:
-        st.markdown(
-            "We flag GPS samples that don't fit physics. RandomForest learns "
-            "the patterns, hand-written rules catch the rest, and a 70/30 "
-            "blend gives the final risk score. Every alert ships with a "
-            "human reason — *position jump 840 m in 1 s → 3,024 km/h* — "
-            "so an operator can decide what to do with it."
-        )
-        st.markdown(
-            "The same pipeline runs on a drone testbed (HackRF spoofing in a lab) "
-            "and on a real autonomous vehicle (university testbed in Arizona). "
-            "Cross-domain numbers below."
-        )
-    with right:
-        st.code(
-            "risk = 0.7 * ml_proba + 0.3 * rule_score\n"
-            "alert if risk > 0.5",
-            language="python",
-        )
-
-    st.divider()
-
-    a, b = st.columns(2)
-    for col, key in zip((a, b), ("uav", "av")):
-        cfg = DATASETS[key]
-        with col:
-            st.markdown(f"**{cfg['label']}**  ·  {cfg['samples']:,} samples")
-            metrics([
-                ("ML", f"{cfg['ml_accuracy']:.1%}", None),
-                ("Rules", f"{cfg['rule_accuracy']:.1%}", None),
-                ("Attacks", f"{cfg['attack_rate']:.1%}", None),
-            ])
-            st.caption(cfg["source"])
-
-
 def dataset_tab(key):
     cfg = DATASETS[key]
     df = generate_track(key)
@@ -463,42 +424,6 @@ def dataset_tab(key):
             "- HDOP / VDOP degradation\n"
             "- acceleration & heading limits"
         )
-
-
-def comparison_tab():
-    st.markdown(
-        "Same model class, same feature pipeline, two very different "
-        "domains. If both numbers stay high, the approach generalises."
-    )
-
-    df = pd.DataFrame({
-        "Dataset": [DATASETS["uav"]["label"], DATASETS["av"]["label"]],
-        "ML": [DATASETS["uav"]["ml_accuracy"], DATASETS["av"]["ml_accuracy"]],
-        "Rules": [DATASETS["uav"]["rule_accuracy"], DATASETS["av"]["rule_accuracy"]],
-    })
-    long = df.melt(id_vars="Dataset", var_name="Method", value_name="Accuracy")
-
-    fig = px.bar(
-        long, x="Dataset", y="Accuracy", color="Method", barmode="group",
-        text=long["Accuracy"].map(lambda v: f"{v:.1%}"),
-        color_discrete_map={"ML": NORMAL, "Rules": "#1f6feb"},
-        height=360,
-    )
-    fig.update_layout(
-        yaxis=dict(tickformat=".0%", range=[0, 1.05]),
-        margin=dict(l=20, r=20, t=20, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        plot_bgcolor="rgba(0,0,0,0)",
-    )
-    fig.update_traces(textposition="outside")
-    st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG, key="cmp")
-
-    st.markdown(
-        "ML carries the load on UAV (100%) where attacks have crisp signatures. "
-        "On the vehicle dataset the ML signal is subtler so rules close the gap "
-        "(88%). The hybrid score keeps both numbers high regardless of which "
-        "signal happens to dominate."
-    )
 
 
 def live_tab():
@@ -574,16 +499,12 @@ def live_tab():
 
 def main():
     header()
-    tabs = st.tabs(["Overview", "UAV", "Ground vehicle", "Comparison", "Live demo"])
+    tabs = st.tabs(["UAV", "Ground vehicle", "Live demo"])
     with tabs[0]:
-        overview_tab()
-    with tabs[1]:
         dataset_tab("uav")
-    with tabs[2]:
+    with tabs[1]:
         dataset_tab("av")
-    with tabs[3]:
-        comparison_tab()
-    with tabs[4]:
+    with tabs[2]:
         live_tab()
 
 
