@@ -38,7 +38,7 @@ Unlike traditional binary classification, our system explains **WHY** it detecte
 ### Installation
 ```bash
 git clone https://github.com/your-username/gnss-guardian
-cd gnss-guardian-final
+cd gnss-guardian
 pip install -r requirements.txt
 ```
 
