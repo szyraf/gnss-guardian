@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Virtualenv
+venv/
+.venv/
+env/
+ENV/
+
+# Data — too large for GitHub, link to source in README instead
+data/
+results/
+*.csv
+*.parquet
+*.h5
+*.npy
+*.npz
+
+# Models
+models/
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / temp
+*.log
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
