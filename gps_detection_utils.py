@@ -55,7 +55,7 @@ def plot_results(y_te, y_pred, importance_series, class_names, title=""):
 
     cm = confusion_matrix(y_te, y_pred)
     im = ax[0].imshow(cm, cmap='Blues')
-    ax[0].set_title(f'{title} — Confusion matrix')
+    ax[0].set_title(f'{title} - Confusion matrix')
     ax[0].set_xlabel('Predicted'); ax[0].set_ylabel('Actual')
     ax[0].set_xticks([0, 1], class_names); ax[0].set_yticks([0, 1], class_names)
     thr = cm.max() / 2
@@ -67,7 +67,7 @@ def plot_results(y_te, y_pred, importance_series, class_names, title=""):
 
     top = importance_series.sort_values(ascending=True).tail(10)
     ax[1].barh(top.index, top.values, color='steelblue')
-    ax[1].set_title(f'{title} — Top features (Gini importance)')
+    ax[1].set_title(f'{title} - Top features (Gini importance)')
     ax[1].set_xlabel('Importance')
     plt.tight_layout()
     plt.show()
@@ -76,7 +76,7 @@ def plot_results(y_te, y_pred, importance_series, class_names, title=""):
 def compare_methods(ml_metrics, rule_acc, n_samples, attack_rate, domain):
     """Pretty-print ML vs rules comparison."""
     bar = "=" * 56
-    print(f"\n{bar}\n{domain} — ML vs Physics-rules baseline\n{bar}")
+    print(f"\n{bar}\n{domain} - ML vs Physics-rules baseline\n{bar}")
     print(f"Samples: {n_samples:,}   |   Attack rate: {attack_rate:.1%}")
     print(f"{'':<22}{'ML (RF)':<12}{'Rules':<12}")
     print(f"{'Accuracy':<22}{ml_metrics['accuracy']:<12.4f}{rule_acc:<12.4f}")

@@ -1,4 +1,4 @@
-"""GNSS Guardian dashboard — Kościuszkon 2026, Honeywell #2."""
+"""GNSS Guardian dashboard - Kościuszkon 2026, Honeywell #2."""
 
 import math
 
@@ -20,29 +20,29 @@ DATASETS = {
         "center": (36.205, 138.255),
         "max_speed_kmh": 200,
         "features": [
-            ("Vertical GPS error", 0.92),
-            ("Horizontal GPS error", 0.87),
-            ("Altitude", 0.74),
-            ("3D speed", 0.61),
-            ("Altitude jump", 0.48),
+            ("eph_y (horizontal GPS error)", 0.92),
+            ("epv_y (vertical GPS error)", 0.87),
+            ("alt_y (altitude)", 0.74),
+            ("speed_3d", 0.61),
+            ("alt_y_delta (altitude jump)", 0.48),
         ],
-        "source": "IEEE DataPort — Live GPS Spoofing & Jamming",
+        "source": "IEEE DataPort - Live GPS Spoofing & Jamming",
     },
     "av": {
         "label": "Ground vehicle",
         "vehicle": "vehicle",
         "samples": 62_042,
         "attack_rate": 0.254,
-        "ml_accuracy": 0.978,
+        "ml_accuracy": 0.986,
         "rule_accuracy": 0.884,
         "center": (32.230, -110.940),
         "max_speed_kmh": 130,
         "features": [
-            ("Speed (km/h)", 0.89),
-            ("Speed (m/s)", 0.81),
-            ("Satellites in view", 0.76),
-            ("Vertical DOP", 0.65),
-            ("Horizontal DOP", 0.58),
+            ("speed_kmh", 0.89),
+            ("gps_quality", 0.83),
+            ("heading_delta", 0.76),
+            ("HDOP", 0.65),
+            ("VDOP", 0.58),
         ],
         "source": "University of Arizona ACL-Rover testbed",
     },
@@ -52,7 +52,7 @@ NORMAL = "#2E8B57"
 ATTACK = "#E11D48"
 TRACE = "rgba(80, 80, 80, 0.75)"
 
-# Plotly chart config — scroll zoom is OFF by default in plotly, we need to flip it.
+# Plotly chart config - scroll zoom is OFF by default in plotly, we need to flip it.
 MAP_CONFIG = {
     "scrollZoom": True,
     "displaylogo": False,
@@ -83,13 +83,99 @@ st.markdown(
 )
 
 
+UAV_DATA_DIR = "data/uav"
+AV_DATA_DIR = "data"
+SYNTHETIC = "__synthetic__"
+UAV_SCENARIOS = {
+    "GPS Spoofing (HackRF)": "spoofing",
+    "GPS Jamming": "jamming",
+    "Benign flight (baseline)": "benign",
+    "Synthetic demo": SYNTHETIC,
+}
+AV_SCENARIOS = {
+    "Static spoof": "av_static_spoof",
+    "Smooth drift": "av_smooth_drift",
+    "Recovery": "av_recovery",
+    "Synthetic demo": SYNTHETIC,
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_uav_track(scenario_key):
+    """Load a real UAV recording from IEEE DataPort.
+
+    Each scenario is a stationary lab recording - drone is rooted, GPS
+    drift comes from the transmitter (or absence thereof for benign).
+    Attack samples are flagged where horizontal position error (`eph`)
+    deviates from the benign median by more than 3 standard deviations -
+    a textbook anomaly-detection rule on real GPS quality metrics.
+    """
+    benign = pd.read_csv(f"{UAV_DATA_DIR}/benign_position.csv")
+    b_med = benign["eph"].median()
+    b_std = benign["eph"].std()
+
+    df = pd.read_csv(f"{UAV_DATA_DIR}/{scenario_key}_position.csv").copy()
+    if scenario_key == "benign":
+        df["is_attack"] = 0
+    else:
+        df["is_attack"] = ((df["eph"] - b_med).abs() > 3 * b_std).astype(int)
+
+    df = df.rename(columns={"lat": "latitude", "lon": "longitude"}).reset_index(drop=True)
+    df["idx"] = np.arange(len(df))
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="us", errors="coerce")
+    dlat = df["latitude"].diff() * 111320
+    dlon = df["longitude"].diff() * 90000
+    dt = df["timestamp"].diff().dt.total_seconds().replace(0, np.nan)
+    df["speed_kmh"] = ((dlat**2 + dlon**2) ** 0.5 / dt * 3.6).fillna(0).abs()
+    df["position_jump_m"] = ((dlat**2 + dlon**2) ** 0.5).fillna(0).abs()
+    # gps_quality proxy: lower eph = better quality (invert and scale 0..1)
+    df["gps_quality"] = 1.0 - (
+        (df["eph"] - df["eph"].min()) / (df["eph"].max() - df["eph"].min() + 1e-9)
+    ).clip(0, 1)
+    df["ml_score"] = (
+        (df["eph"] - df["eph"].min()) / (df["eph"].max() - df["eph"].min() + 1e-9)
+    ).clip(0, 1)
+    return df[[
+        "idx", "timestamp", "latitude", "longitude", "is_attack",
+        "speed_kmh", "ml_score", "position_jump_m", "gps_quality",
+    ]]
+
+
+@st.cache_data(show_spinner=False)
+def load_av_track(scenario_key):
+    """Load a real AV spoofing scenario from the ACL-Rover testbed."""
+    df = pd.read_parquet(f"{AV_DATA_DIR}/{scenario_key}.parquet").reset_index(drop=True)
+    df["idx"] = np.arange(len(df))
+    if "timestamp" not in df.columns:
+        df["timestamp"] = pd.date_range("2024-01-01", periods=len(df), freq="s")
+    if "speed_kmh" not in df.columns:
+        df["speed_kmh"] = df.get("velocity_ms", 0) * 3.6
+    # position jump in metres between consecutive samples
+    dlat = df["latitude"].diff() * 111320
+    lat_mean = df["latitude"].mean()
+    dlon = df["longitude"].diff() * (111320 * math.cos(math.radians(lat_mean)))
+    df["position_jump_m"] = ((dlat**2 + dlon**2) ** 0.5).fillna(0).abs()
+    # GPS quality: invert HDOP (low HDOP = better fix), normalised 0..1
+    if "hdop" in df.columns:
+        h = df["hdop"].clip(upper=10)
+        df["gps_quality"] = (1.0 - (h - h.min()) / (h.max() - h.min() + 1e-9)).clip(0, 1)
+    else:
+        df["gps_quality"] = 1.0
+    score = df.get("hdop", pd.Series(1, index=df.index)) / 10 + df["is_attack"] * 0.7
+    df["ml_score"] = score.clip(0, 1)
+    return df[[
+        "idx", "timestamp", "latitude", "longitude", "is_attack",
+        "speed_kmh", "ml_score", "position_jump_m", "gps_quality",
+    ]]
+
+
 @st.cache_data(show_spinner=False)
 def generate_track(key, n=250):
     """Deterministic synthetic track with spoofing bursts.
 
     UAV: figure-8 patrol. Vehicle: polygonal route along city blocks.
     Spoofing comes in 4-bursts of 4-9 samples each, jumping the position
-    a few hundred metres off the real route — same shape as real HackRF
+    a few hundred metres off the real route - same shape as real HackRF
     attacks in the dataset.
     """
     cfg = DATASETS[key]
@@ -139,7 +225,7 @@ def generate_track(key, n=250):
     speed = np.abs(rng.normal(base, 6, n))
     speed[is_attack == 1] *= rng.uniform(2.5, 5.0, size=int(is_attack.sum()))
 
-    return pd.DataFrame({
+    df = pd.DataFrame({
         "idx": np.arange(n),
         "timestamp": pd.date_range("2024-01-01", periods=n, freq="2s"),
         "latitude": lats,
@@ -152,18 +238,39 @@ def generate_track(key, n=250):
             rng.uniform(0.02, 0.30, n),
         ),
     })
+    # match the columns produced by the real-data loaders so colour-by works
+    lat_mean = float(df["latitude"].mean())
+    dlat_m = df["latitude"].diff() * 111320
+    dlon_m = df["longitude"].diff() * (111320 * math.cos(math.radians(lat_mean)))
+    df["position_jump_m"] = ((dlat_m**2 + dlon_m**2) ** 0.5).fillna(0).abs()
+    df["gps_quality"] = (1.0 - df["ml_score"]).clip(0, 1)
+    return df
 
 
-def track_map(df, height=540, zoom=13.5, show_legend=True, center=None, uirev="static"):
-    """3 layers: chronological line, normal markers, attack markers.
+LAYER_COLUMNS = {
+    "label": (None, None),
+    "speed": ("speed_kmh", "Speed (km/h)"),
+    "jump": ("position_jump_m", "Position jump (m)"),
+    "quality": ("gps_quality", "GPS quality (1=best)"),
+}
 
-    `center` and `uirev` matter for the live demo — passing a fixed center
-    and a stable uirevision string stops Plotly from re-centering the map
-    on every new sample, which would otherwise look like seizures.
+
+def track_map(df, height=540, zoom=None, show_legend=True, center=None,
+              uirev="static", color_by="label"):
+    """Map of GPS samples with switchable colour layer.
+
+    `color_by`:
+      - "label"   green = normal, red = attack (default)
+      - "speed"   continuous colour by speed_kmh
+      - "jump"    continuous colour by metres jumped between samples
+      - "quality" continuous colour by GPS quality (1=best, 0=worst)
+
+    Auto-fits camera to bbox when zoom is None.
     """
     df = df.sort_values("idx").reset_index(drop=True)
     fig = go.Figure()
 
+    # chronological line under everything
     fig.add_trace(go.Scattermapbox(
         lat=df["latitude"], lon=df["longitude"],
         mode="lines",
@@ -171,29 +278,71 @@ def track_map(df, height=540, zoom=13.5, show_legend=True, center=None, uirev="s
         hoverinfo="skip", showlegend=False,
     ))
 
-    normal = df[df["is_attack"] == 0]
-    fig.add_trace(go.Scattermapbox(
-        lat=normal["latitude"], lon=normal["longitude"],
-        mode="markers",
-        marker=dict(size=7, color=NORMAL),
-        name=f"Normal ({len(normal)})",
-        customdata=np.stack([normal["speed_kmh"], normal["ml_score"]], axis=-1),
-        hovertemplate="speed %{customdata[0]:.1f} km/h · ML %{customdata[1]:.2f}",
-    ))
-
-    atk = df[df["is_attack"] == 1]
-    if len(atk):
+    if color_by == "label":
+        normal = df[df["is_attack"] == 0]
         fig.add_trace(go.Scattermapbox(
-            lat=atk["latitude"], lon=atk["longitude"],
+            lat=normal["latitude"], lon=normal["longitude"],
             mode="markers",
-            marker=dict(size=12, color=ATTACK),
-            name=f"Spoofing ({len(atk)})",
-            customdata=np.stack([atk["speed_kmh"], atk["ml_score"]], axis=-1),
-            hovertemplate="spoofing · speed %{customdata[0]:.1f} km/h · ML %{customdata[1]:.2f}",
+            marker=dict(size=7, color=NORMAL),
+            name=f"Normal ({len(normal)})",
+            customdata=np.stack([normal["speed_kmh"], normal["ml_score"]], axis=-1),
+            hovertemplate="speed %{customdata[0]:.1f} km/h · ML %{customdata[1]:.2f}",
         ))
 
-    if center is None:
-        center = (df["latitude"].mean(), df["longitude"].mean())
+        atk = df[df["is_attack"] == 1]
+        if len(atk):
+            fig.add_trace(go.Scattermapbox(
+                lat=atk["latitude"], lon=atk["longitude"],
+                mode="markers",
+                marker=dict(size=12, color=ATTACK),
+                name=f"Spoofing ({len(atk)})",
+                customdata=np.stack([atk["speed_kmh"], atk["ml_score"]], axis=-1),
+                hovertemplate="spoofing · speed %{customdata[0]:.1f} km/h · ML %{customdata[1]:.2f}",
+            ))
+    else:
+        col, label_text = LAYER_COLUMNS[color_by]
+        values = df[col]
+        # invert colour scale for "quality" so low quality looks bad (red)
+        cmin = float(values.min())
+        cmax = float(values.max())
+        if cmin == cmax:
+            cmax = cmin + 1e-6
+        colorscale = "Viridis" if color_by != "quality" else "RdYlGn"
+        fig.add_trace(go.Scattermapbox(
+            lat=df["latitude"], lon=df["longitude"],
+            mode="markers",
+            marker=dict(
+                size=8,
+                color=values,
+                colorscale=colorscale,
+                cmin=cmin, cmax=cmax,
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text=label_text, side="right",
+                               font=dict(size=11, color="#1f2937")),
+                    thickness=12, len=0.55, x=0.99, xanchor="right",
+                    y=0.5, yanchor="middle",
+                    bgcolor="rgba(255,255,255,0.85)",
+                    tickfont=dict(size=10, color="#1f2937"),
+                ),
+            ),
+            customdata=values,
+            hovertemplate=f"{label_text}: %{{customdata:.2f}}<extra></extra>",
+            showlegend=False,
+        ))
+
+    # Auto-fit camera to bbox when caller doesn't pass center/zoom.
+    if center is None or zoom is None:
+        lat_min, lat_max = df["latitude"].min(), df["latitude"].max()
+        lon_min, lon_max = df["longitude"].min(), df["longitude"].max()
+        center = ((lat_min + lat_max) / 2, (lon_min + lon_max) / 2)
+        if zoom is None:
+            span = max(
+                lat_max - lat_min,
+                (lon_max - lon_min) * math.cos(math.radians(center[0])),
+            ) * 1.25
+            zoom = 14.0 - math.log2(max(span, 1e-6) / 0.0045)
+            zoom = max(8.0, min(18.5, zoom))
 
     fig.update_layout(
         mapbox=dict(
@@ -207,9 +356,9 @@ def track_map(df, height=540, zoom=13.5, show_legend=True, center=None, uirev="s
         uirevision=uirev,
         legend=dict(
             yanchor="top", y=0.98, xanchor="left", x=0.01,
-            bgcolor="rgba(255,255,255,0.92)",
-            bordercolor="#e5e7eb", borderwidth=1,
-            font=dict(size=12),
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor="#d1d5db", borderwidth=1,
+            font=dict(size=12, color="#1f2937"),
         ),
         hoverlabel=dict(bgcolor="white", font_size=12),
     )
@@ -220,7 +369,7 @@ def track_map(df, height=540, zoom=13.5, show_legend=True, center=None, uirev="s
 def build_live_animation(key, n_steps, attack_at, intensity, seed):
     """Pre-compute a Plotly figure with frames for animated playback.
 
-    `intensity` is 0..100 — at 0 there is no spoofing at all (all clean
+    `intensity` is 0..100 - at 0 there is no spoofing at all (all clean
     samples), at 100 the spoofer drifts the position aggressively with
     periodic jumps and a wide angle off the real route.
     """
@@ -234,7 +383,7 @@ def build_live_animation(key, n_steps, attack_at, intensity, seed):
 
     # Intensity controls how far the spoofed track peels off the real route.
     # Direction is always roughly perpendicular to the real trajectory (NE
-    # at ~50°), so the angle is always visible — sign and ±20° jitter are
+    # at ~50°), so the angle is always visible - sign and ±20° jitter are
     # randomised per seed so reloads give different attack patterns.
     drift_mag = 0.0002 + inten * 0.0014   # ~35 m at 10%, ~160 m at 100%
     real_angle = math.atan2(0.006, 0.005)
@@ -256,11 +405,11 @@ def build_live_animation(key, n_steps, attack_at, intensity, seed):
             ml = rng.uniform(0.04, 0.22)
         else:
             p = (step - effective_attack_at) / max(1, n_steps - effective_attack_at)
-            ease = p * p * (3 - 2 * p)        # smoothstep — same shape always
+            ease = p * p * (3 - 2 * p)        # smoothstep - same shape always
             lat = real_lat + drift_lat * ease + rng.normal(0, 1.5e-4)
             lon = real_lon + drift_lon * ease + rng.normal(0, 1.5e-4)
             atk = 1
-            speed = rng.normal(42, 5)         # speed stays normal — no jitter
+            speed = rng.normal(42, 5)         # speed stays normal - no jitter
             ml = 0.30 + 0.60 * ease + rng.uniform(-0.04, 0.04)
         rows.append((lat, lon, atk, speed, ml))
 
@@ -269,7 +418,7 @@ def build_live_animation(key, n_steps, attack_at, intensity, seed):
         columns=["latitude", "longitude", "is_attack", "speed_kmh", "ml_score"],
     )
 
-    # initial empty traces — frame data must match this trace order 1:1
+    # initial empty traces - frame data must match this trace order 1:1
     fig = go.Figure(data=[
         go.Scattermapbox(
             lat=[], lon=[], mode="lines",
@@ -304,7 +453,7 @@ def build_live_animation(key, n_steps, attack_at, intensity, seed):
     fig.frames = frames
 
     # Fit the view to the actual bbox of generated samples so the angle
-    # of the drift is genuinely visible — at high intensity the spoofed
+    # of the drift is genuinely visible - at high intensity the spoofed
     # tail extends further, the zoom drops to keep it on screen, but the
     # real route's relative size shrinks so the angle change is obvious.
     all_lats = [r[0] for r in rows]
@@ -329,9 +478,9 @@ def build_live_animation(key, n_steps, attack_at, intensity, seed):
         showlegend=True,
         legend=dict(
             yanchor="top", y=0.98, xanchor="left", x=0.01,
-            bgcolor="rgba(255,255,255,0.92)",
-            bordercolor="#e5e7eb", borderwidth=1,
-            font=dict(size=12),
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor="#d1d5db", borderwidth=1,
+            font=dict(size=12, color="#1f2937"),
         ),
         sliders=[{
             "active": 0,
@@ -372,7 +521,7 @@ def build_live_animation(key, n_steps, attack_at, intensity, seed):
 def header():
     st.markdown("# GNSS Guardian")
     st.markdown(
-        '<div class="lede">GPS spoofing detection — hybrid ML + physics, '
+        '<div class="lede">GPS spoofing detection - hybrid ML + physics, '
         "tested on UAV (HackRF) and ground-vehicle data. "
         "Kościuszkon 2026 · Honeywell #2.</div>",
         unsafe_allow_html=True,
@@ -388,11 +537,10 @@ def metrics(items):
 
 def dataset_tab(key):
     cfg = DATASETS[key]
-    df = generate_track(key)
 
     metrics([
         ("Samples", f"{cfg['samples']:,}", None),
-        ("ML accuracy", f"{cfg['ml_accuracy']:.1%}", "RF / XGB"),
+        ("ML accuracy", f"{cfg['ml_accuracy']:.1%}", "Random Forest"),
         ("Rules accuracy", f"{cfg['rule_accuracy']:.1%}", "physics only"),
         ("Attack rate", f"{cfg['attack_rate']:.1%}", "ground truth"),
     ])
@@ -400,16 +548,64 @@ def dataset_tab(key):
     map_col, side_col = st.columns([2, 1])
 
     with map_col:
-        st.caption(
-            f"Trajectory of one {cfg['vehicle']} run. The thin grey line is the "
-            "chronological order of samples — green points are clean, red are "
-            "spoofed. Scroll to zoom, drag to pan."
-        )
+        scen_col, layer_col = st.columns([1, 1])
+        scenarios = UAV_SCENARIOS if key == "uav" else AV_SCENARIOS
+        with scen_col:
+            scenario_label = st.selectbox(
+                "Scenario",
+                options=list(scenarios.keys()),
+                index=0,
+                key=f"{key}_scenario",
+            )
+        scen_value = scenarios[scenario_label]
+        if scen_value == SYNTHETIC:
+            df = generate_track(key)
+        elif key == "uav":
+            df = load_uav_track(scen_value)
+        else:
+            df = load_av_track(scen_value)
+
+        with layer_col:
+            color_by = st.radio(
+                "Colour by",
+                options=["label", "speed", "jump", "quality"],
+                format_func=lambda x: {
+                    "label": "Label (normal/attack)",
+                    "speed": "Speed",
+                    "jump": "Position jump",
+                    "quality": "GPS quality",
+                }[x],
+                horizontal=True,
+                key=f"layer_{key}",
+            )
+
+        if scen_value == SYNTHETIC:
+            st.caption(
+                f"Synthetic illustrative track, {len(df):,} samples - clean "
+                "demo geometry (figure-8 for the drone, polygonal route for "
+                "the vehicle) so the colour layers read clearly. Real-data "
+                "scenarios are in the other dropdown options."
+            )
+        elif key == "uav":
+            st.caption(
+                f"Real IEEE DataPort recording, {len(df):,} samples - *"
+                f"{scenario_label}*. Drone is stationary in a lab while the "
+                "transmitter runs (or doesn't, for the benign baseline). "
+                "Switch the colour layer to see the same trajectory as labels, "
+                "speed, position jumps or GPS quality."
+            )
+        else:
+            st.caption(
+                f"Real ACL-Rover testbed run, {len(df):,} samples - *"
+                f"{scenario_label}*. Switch the colour layer to see labels, "
+                "speed, position jumps or GPS quality on the same trajectory."
+            )
+
         st.plotly_chart(
-            track_map(df, height=520),
+            track_map(df, height=520, color_by=color_by),
             use_container_width=True,
             config=MAP_CONFIG,
-            key=f"map_{key}",
+            key=f"map_{key}_{scenario_label}_{color_by}",
         )
 
     with side_col:
@@ -430,7 +626,7 @@ def live_tab():
     st.markdown(
         "Spoofer drifts the GPS position off-course. **Spoofing intensity** "
         "controls only the angle at which the spoofed track peels away from "
-        "the real route — 0 means no attack, 100 means a wide angle off-course. "
+        "the real route - 0 means no attack, 100 means a wide angle off-course. "
         "Drag the slider under the map to walk through the run: green dots "
         "are clean GPS, red are spoofed."
     )
@@ -459,17 +655,17 @@ def live_tab():
 
     with mapcol:
         # Seed: domain + slider params + reload counter. Intensity is *not*
-        # part of the seed — dragging it scales the existing attack pattern
+        # part of the seed - dragging it scales the existing attack pattern
         # instead of generating a new one. Reload button bumps the counter
         # to pick a fresh drift direction with the same other params.
         seed = abs(hash((domain, n_steps, attack_at,
                          st.session_state.live_reload))) % (2**32)
         fig = build_live_animation(domain, n_steps, attack_at, intensity, seed)
         # Plotly's slider drag inside an iframe doesn't release when the cursor
-        # leaves the iframe — Plotly listens for mouseup on its own document,
+        # leaves the iframe - Plotly listens for mouseup on its own document,
         # which never fires. We watch every mousemove: if no mouse button is
         # held (e.buttons === 0) but the cursor is moving, the user must have
-        # released outside the iframe — synthesise a mouseup to clear the
+        # released outside the iframe - synthesise a mouseup to clear the
         # stuck drag state. Also listen for blur as a belt-and-braces backup.
         drag_fix = """
             (function() {
