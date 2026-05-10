@@ -1,13 +1,13 @@
 """GNSS Guardian dashboard — Kościuszkon 2026, Honeywell #2."""
 
-import time
-from datetime import datetime
+import math
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 DATASETS = {
@@ -218,6 +218,159 @@ def track_map(df, height=540, zoom=13.5, show_legend=True, center=None, uirev="s
     return fig
 
 
+@st.cache_data(show_spinner=False)
+def build_live_animation(key, n_steps, attack_at, intensity, seed):
+    """Pre-compute a Plotly figure with frames for animated playback.
+
+    `intensity` is 0..100 — at 0 there is no spoofing at all (all clean
+    samples), at 100 the spoofer drifts the position aggressively with
+    periodic jumps and a wide angle off the real route.
+    """
+    cfg = DATASETS[key]
+    rng = np.random.default_rng(seed)
+    clat, clon = cfg["center"]
+
+    inten = max(0.0, min(1.0, intensity / 100.0))
+    # When intensity is 0, never enter the spoofing branch.
+    effective_attack_at = attack_at if inten > 0 else n_steps + 1
+
+    # Intensity controls how far the spoofed track peels off the real route.
+    # Direction is always roughly perpendicular to the real trajectory (NE
+    # at ~50°), so the angle is always visible — sign and ±20° jitter are
+    # randomised per seed so reloads give different attack patterns.
+    drift_mag = 0.0002 + inten * 0.0014   # ~35 m at 10%, ~160 m at 100%
+    real_angle = math.atan2(0.006, 0.005)
+    side = 1 if rng.random() < 0.5 else -1
+    attack_angle = real_angle + side * math.pi / 2 + rng.uniform(-0.35, 0.35)
+    drift_lat = drift_mag * math.sin(attack_angle)
+    drift_lon = drift_mag * math.cos(attack_angle)
+
+    rows = []
+    for step in range(n_steps):
+        t = step / max(1, n_steps - 1)
+        real_lat = clat + 0.006 * t
+        real_lon = clon + 0.005 * t
+
+        if step < effective_attack_at:
+            lat = real_lat + rng.normal(0, 1e-4)
+            lon = real_lon + rng.normal(0, 1e-4)
+            atk, speed = 0, rng.normal(40, 4)
+            ml = rng.uniform(0.04, 0.22)
+        else:
+            p = (step - effective_attack_at) / max(1, n_steps - effective_attack_at)
+            ease = p * p * (3 - 2 * p)        # smoothstep — same shape always
+            lat = real_lat + drift_lat * ease + rng.normal(0, 1.5e-4)
+            lon = real_lon + drift_lon * ease + rng.normal(0, 1.5e-4)
+            atk = 1
+            speed = rng.normal(42, 5)         # speed stays normal — no jitter
+            ml = 0.30 + 0.60 * ease + rng.uniform(-0.04, 0.04)
+        rows.append((lat, lon, atk, speed, ml))
+
+    df = pd.DataFrame(
+        rows,
+        columns=["latitude", "longitude", "is_attack", "speed_kmh", "ml_score"],
+    )
+
+    # initial empty traces — frame data must match this trace order 1:1
+    fig = go.Figure(data=[
+        go.Scattermapbox(
+            lat=[], lon=[], mode="lines",
+            line=dict(width=1.5, color=TRACE),
+            hoverinfo="skip", showlegend=False,
+        ),
+        go.Scattermapbox(
+            lat=[], lon=[], mode="markers",
+            marker=dict(size=7, color=NORMAL),
+            name="Normal",
+        ),
+        go.Scattermapbox(
+            lat=[], lon=[], mode="markers",
+            marker=dict(size=12, color=ATTACK),
+            name="Spoofing",
+        ),
+    ])
+
+    frames = []
+    for i in range(1, n_steps + 1):
+        sub = df.iloc[:i]
+        normal = sub[sub["is_attack"] == 0]
+        atk_sub = sub[sub["is_attack"] == 1]
+        frames.append(go.Frame(
+            name=str(i),
+            data=[
+                go.Scattermapbox(lat=sub["latitude"], lon=sub["longitude"]),
+                go.Scattermapbox(lat=normal["latitude"], lon=normal["longitude"]),
+                go.Scattermapbox(lat=atk_sub["latitude"], lon=atk_sub["longitude"]),
+            ],
+        ))
+    fig.frames = frames
+
+    # Fit the view to the actual bbox of generated samples so the angle
+    # of the drift is genuinely visible — at high intensity the spoofed
+    # tail extends further, the zoom drops to keep it on screen, but the
+    # real route's relative size shrinks so the angle change is obvious.
+    all_lats = [r[0] for r in rows]
+    all_lons = [r[1] for r in rows]
+    lat_min, lat_max = min(all_lats), max(all_lats)
+    lon_min, lon_max = min(all_lons), max(all_lons)
+    view_center = ((lat_min + lat_max) / 2, (lon_min + lon_max) / 2)
+    # Plotly mapbox zoom: roughly each unit doubles the visible span.
+    # Empirically zoom 14 fits ~0.0045°, zoom 13 fits ~0.009°, etc.
+    span = max(lat_max - lat_min, (lon_max - lon_min) * math.cos(math.radians(clat))) * 1.2
+    view_zoom = 14.0 - math.log2(max(span, 1e-5) / 0.0045)
+    view_zoom = max(11.5, min(15.0, view_zoom))
+
+    fig.update_layout(
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=view_center[0], lon=view_center[1]),
+            zoom=view_zoom,
+        ),
+        margin=dict(l=0, r=0, t=0, b=70),
+        height=560,
+        showlegend=True,
+        legend=dict(
+            yanchor="top", y=0.98, xanchor="left", x=0.01,
+            bgcolor="rgba(255,255,255,0.92)",
+            bordercolor="#e5e7eb", borderwidth=1,
+            font=dict(size=12),
+        ),
+        sliders=[{
+            "active": 0,
+            "x": 0.04, "y": 0, "len": 0.92,
+            "pad": {"t": 30, "b": 20, "l": 0, "r": 0},
+            "currentvalue": {
+                "prefix": "Sample ",
+                "visible": True,
+                "xanchor": "left",
+                "offset": 10,
+                "font": {"size": 13, "color": "#374151"},
+            },
+            "transition": {"duration": 0},
+            "bgcolor": "#e5e7eb",
+            "activebgcolor": NORMAL,
+            "bordercolor": "rgba(0,0,0,0)",
+            "borderwidth": 0,
+            "tickcolor": "rgba(0,0,0,0)",
+            "ticklen": 0,
+            "minorticklen": 0,
+            "font": {"size": 1, "color": "rgba(0,0,0,0)"},
+            "steps": [
+                {
+                    "label": str(i),
+                    "method": "animate",
+                    "args": [[str(i)], {
+                        "frame": {"duration": 0, "redraw": True},
+                        "mode": "immediate",
+                    }],
+                }
+                for i in range(1, n_steps + 1)
+            ],
+        }],
+    )
+    return fig
+
+
 def header():
     st.markdown("# GNSS Guardian")
     st.markdown(
@@ -350,9 +503,15 @@ def comparison_tab():
 
 def live_tab():
     st.markdown(
-        "Stream samples one at a time. The path is drawn in chronological "
-        "order, so the moment the position jumps off the route is visible."
+        "Spoofer drifts the GPS position off-course. **Spoofing intensity** "
+        "controls only the angle at which the spoofed track peels away from "
+        "the real route — 0 means no attack, 100 means a wide angle off-course. "
+        "Drag the slider under the map to walk through the run: green dots "
+        "are clean GPS, red are spoofed."
     )
+
+    if "live_reload" not in st.session_state:
+        st.session_state.live_reload = 0
 
     settings, mapcol = st.columns([1, 3])
 
@@ -368,76 +527,49 @@ def live_tab():
             10, max(15, n_steps - 5),
             min(n_steps // 2, n_steps - 5),
         )
-        run = st.button("Run", type="primary", use_container_width=True)
+        intensity = st.slider("Spoofing intensity", 0, 100, 50)
+        if st.button("↻ Reload", use_container_width=True,
+                     help="Re-randomise the drift direction"):
+            st.session_state.live_reload += 1
 
     with mapcol:
-        slot = st.empty()
-        if run:
-            stream(slot, domain, n_steps, attack_at)
-        else:
-            preview = generate_track(domain).head(60)
-            slot.plotly_chart(
-                track_map(preview, height=480, show_legend=False),
-                use_container_width=True,
-                config=MAP_CONFIG,
-                key="live_preview",
-            )
-
-
-def stream(slot, key, n_steps, attack_at):
-    cfg = DATASETS[key]
-    rng = np.random.default_rng()
-    clat, clon = cfg["center"]
-
-    # pick a drift direction that's clearly off-route
-    drift_lat = rng.uniform(-0.008, 0.008)
-    drift_lon = rng.uniform(-0.008, 0.008)
-    while abs(drift_lat) < 0.004 and abs(drift_lon) < 0.004:
-        drift_lat *= 1.5
-        drift_lon *= 1.5
-
-    # Fix the view once — the route ends ~0.006° from center, drift adds ~0.008°,
-    # so a slight offset + zoom 12.5 keeps both clean track and spoofing in frame.
-    view_center = (clat + drift_lat * 0.25 + 0.003, clon + drift_lon * 0.25 + 0.0025)
-    view_zoom = 12.5
-
-    rows = []
-    for step in range(n_steps):
-        t = step / max(1, n_steps - 1)
-        if step < attack_at:
-            lat = clat + 0.006 * t + rng.normal(0, 1e-4)
-            lon = clon + 0.005 * t + rng.normal(0, 1e-4)
-            atk = 0
-            speed = rng.normal(40, 4)
-            ml = rng.uniform(0.04, 0.22)
-        else:
-            at = (step - attack_at) / max(1, n_steps - attack_at)
-            base_lat = clat + 0.006 * (attack_at / max(1, n_steps - 1))
-            base_lon = clon + 0.005 * (attack_at / max(1, n_steps - 1))
-            lat = base_lat + drift_lat * at + rng.normal(0, 2e-4)
-            lon = base_lon + drift_lon * at + rng.normal(0, 2e-4)
-            atk = 1
-            speed = rng.normal(180, 15)
-            ml = rng.uniform(0.78, 0.98)
-
-        rows.append({
-            "idx": step,
-            "timestamp": datetime.now(),
-            "latitude": lat,
-            "longitude": lon,
-            "is_attack": atk,
-            "speed_kmh": speed,
-            "ml_score": ml,
-        })
-
-        df = pd.DataFrame(rows)
-        slot.plotly_chart(
-            track_map(df, height=480, zoom=view_zoom, center=view_center, uirev="live"),
-            use_container_width=True,
+        # Seed: domain + slider params + reload counter. Intensity is *not*
+        # part of the seed — dragging it scales the existing attack pattern
+        # instead of generating a new one. Reload button bumps the counter
+        # to pick a fresh drift direction with the same other params.
+        seed = abs(hash((domain, n_steps, attack_at,
+                         st.session_state.live_reload))) % (2**32)
+        fig = build_live_animation(domain, n_steps, attack_at, intensity, seed)
+        # Plotly's slider drag inside an iframe doesn't release when the cursor
+        # leaves the iframe — Plotly listens for mouseup on its own document,
+        # which never fires. We watch every mousemove: if no mouse button is
+        # held (e.buttons === 0) but the cursor is moving, the user must have
+        # released outside the iframe — synthesise a mouseup to clear the
+        # stuck drag state. Also listen for blur as a belt-and-braces backup.
+        drag_fix = """
+            (function() {
+                function fireUp(e) {
+                    document.dispatchEvent(new MouseEvent('mouseup', {
+                        bubbles: true, cancelable: true, button: 0,
+                        clientX: e && e.clientX || 0,
+                        clientY: e && e.clientY || 0,
+                    }));
+                }
+                document.addEventListener('mousemove', function(e) {
+                    if (e.buttons === 0) fireUp(e);
+                }, true);
+                window.addEventListener('blur', function() { fireUp(); });
+                document.addEventListener('mouseleave', fireUp);
+            })();
+        """
+        html = fig.to_html(
+            include_plotlyjs="cdn",
+            full_html=False,
+            auto_play=False,
             config=MAP_CONFIG,
-            key="live_stream",
+            post_script=drag_fix,
         )
-        time.sleep(0.28)
+        components.html(html, height=620, scrolling=False)
 
 
 def main():
